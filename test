@@ -1,0 +1,278 @@
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"io/fs"
+	"log"
+	"main/trie"
+	"os"
+	"strings"
+
+	// "main/helloworld"
+
+	// "net"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"flag"
+
+	// "google.golang.org/grpc"
+	"gorm.io/gorm"
+)
+
+type AppInfo struct {
+	Name string
+	Exec string
+	Icon string
+}
+
+var AppList []AppInfo
+
+func init() {
+	cdir := "/usr/share/applications"
+	if err := filepath.WalkDir(cdir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// 处理遍历过程中的错误
+			return err
+		}
+		if path == "/usr/share/applications" {
+			return nil
+		}
+		log.Println("prase:", path)
+		if d.IsDir() {
+			log.Println("skip:", path)
+			return filepath.SkipDir
+		}
+		//read file content with path
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		scanner := bufio.NewScanner(file)
+		var start = false
+		for scanner.Scan() {
+			var line = scanner.Text()
+			if line == "[Desktop Entry]" {
+				start = true
+				break
+			}
+		}
+		if start {
+			var app = AppInfo{}
+			for scanner.Scan() {
+				var line = scanner.Text()
+				//startwith
+				if strings.HasPrefix(line, "[") {
+					break
+				} else if strings.HasPrefix(line, "Name=") {
+					app.Name = line[5:]
+				} else if strings.HasPrefix(line, "Exec=") {
+					app.Exec = line[5:]
+				} else if strings.HasPrefix(line, "Icon=") {
+					app.Icon = line[5:]
+				}
+			}
+			log.Printf("app: %+v\n", app)
+			AppList = append(AppList, app)
+
+		}
+		if err := scanner.Err(); err != nil {
+			return err
+		}
+
+		return nil
+	}); err != nil {
+		fmt.Println("Error:", err)
+	}
+}
+
+var (
+	port = flag.Int("port", 50051, "The server port")
+)
+
+// server is used to implement helloworld.GreeterServer.
+
+// type server struct {
+// 	helloworld.UnimplementedGreeterServer
+// }
+
+// // SayHello implements helloworld.GreeterServer
+// func (s *server) SayHello(ctx context.Context, in *helloworld.HelloRequest) (*helloworld.HelloReply, error) {
+// 	log.Printf("Received: %v", in.GetName())
+// 	return &helloworld.HelloReply{Message: "Hello " + in.GetName()}, nil
+// }
+
+// github.com/mattn/go-sqlite3
+var rwmu sync.RWMutex
+
+var db *gorm.DB = nil
+
+type set map[string]struct{}
+
+var ignorename = set{
+	".git": {},
+}
+var ignorepath = set{}
+
+type Doc struct {
+	Name      string
+	Path      string `gorm:"primarykey"`
+	IsDir     bool
+	ModTime   time.Time
+	DeletedAt gorm.DeletedAt `gorm:"index"`
+}
+
+var DocModel Doc
+
+func update(onceignorepath, onceignorename set) {
+	rootDir := "." // 指定根目录
+	var needdeldoc = set{}
+	if err := filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// 处理遍历过程中的错误
+			return err
+		}
+		_, ok := onceignorename[path]
+		if ok {
+			return filepath.SkipDir
+		}
+		if _, ok := onceignorepath[path]; ok {
+			return filepath.SkipDir
+		}
+		if path == "." {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+
+		delete(needdeldoc, path)
+		var tmp = Doc{Path: path}
+		switch err = db.First(&tmp).Error; err {
+		case nil:
+			if tmp.ModTime.Compare(info.ModTime()) != 0 {
+				log.Printf("update: %s doctime: %s filetime: %s\n", path, tmp.ModTime, info.ModTime())
+				if err = db.Model(&tmp).Updates(Doc{IsDir: d.IsDir(), ModTime: info.ModTime()}).Error; err != nil {
+					return err
+				}
+				var Sub []Doc
+
+				// Model(&DocModel).Where("name LIKE ?", path+"/%").Find(&Sub).Error
+				if err = db.Find(&Sub, "path LIKE ?", path+"/%").Error; err != nil {
+					return err
+				}
+				for _, doc := range Sub {
+					needdeldoc[doc.Path] = struct{}{}
+				}
+			}
+		case gorm.ErrRecordNotFound:
+			fmt.Println("not found")
+			var tmp = Doc{Path: path}
+			if err = db.Unscoped().First(&tmp).Error; err == nil {
+				log.Println("recover:", path)
+				err = db.Unscoped().Model(&tmp).Update("deleted_at", nil).Updates(Doc{IsDir: d.IsDir(), ModTime: info.ModTime()}).Error
+				if err != nil {
+					return err
+				}
+				log.Println("recover:", path, "success")
+				return nil
+			}
+			tmp = Doc{
+				Name:    d.Name(),
+				Path:    path,
+				IsDir:   d.IsDir(),
+				ModTime: info.ModTime(),
+			}
+			if err = db.Create(&tmp).Error; err != nil {
+				return err
+			}
+		default:
+			return err
+		}
+		return nil
+	}); err != nil {
+		fmt.Println("Error:", err)
+	}
+	var DelModel Doc
+	for path := range needdeldoc {
+		fmt.Println("delete:", path)
+		DelModel.Path = path
+		if err := db.Delete(&DelModel).Error; err != nil {
+			fmt.Println("Error:", err)
+		}
+	}
+}
+func main() {
+	var t = trie.NewTrie()
+	t.Insert("hello", 1)
+	t.Insert("world", 2)
+	t.Insert("hello world", 3)
+	t.Insert("hello world", 4)
+	t.Print(func(i interface{}) { fmt.Println(i) })
+	flag.Parse()
+
+	// var err error
+	// db, err = gorm.Open(sqlite.Open("gorm.db"), &gorm.Config{})
+	// if err != nil {
+	// 	panic("failed to connect database")
+	// }
+	// db.AutoMigrate(&DocModel)
+	// update(ignorepath, ignorename)
+	// var all []Doc
+	// if err = db.Model(&DocModel).Find(&all).Error; err != nil {
+	// 	fmt.Println("Error:", err)
+	// }
+	// for _, doc := range all {
+	// 	fmt.Printf("%+v\n", doc)
+	// }
+}
+
+// func init() {
+// var err error
+// var cfgPath string
+// home := os.Getenv("HOME")
+// if home == "" {
+// 	log.Println("Can't Find Home Path")
+// } else {
+// 	cfgPath = home + "/.config/qst/config.yaml"
+// 	_, err = os.Stat(cfgPath)
+// 	if os.IsNotExist(err) {
+// 		log.Printf("%s Not Exist. Error:%v\n", cfgPath, err)
+// 	} else if err == nil {
+// 	}
+// }
+// if cfg == nil {
+// 	cfgPath = "/usr/share/qst/config.xcl"
+// 	_, err = os.Stat(cfgPath)
+// 	if os.IsNotExist(err) {
+// 		log.Printf("%s Not Exist. Error:%v\n", cfgPath, err)
+// 	} else if err == nil {
+// 		if err != nil {
+// 			log.Printf("Load Config Error. Error:%v\n", err)
+// 			os.Exit(1)
+// 		}
+// 	}
+// }
+// if home != "" {
+// 	cfgPath = home + "/.config/qst/config.xcl"
+// 	// cfg, err = xcl.NewXcl(cfgPath)
+// 	if err != nil {
+// 		log.Printf("New Xcl With %s Error. Error:%v\n", cfgPath, err)
+// 	}
+// }
+// if cfg == nil {
+// 	cfgPath = "/usr/share/qst/config.xcl"
+// 	// cfg, err = xcl.NewXcl("/usr/share/qst/config.xcl")
+// 	if err != nil {
+// 		log.Printf("New Xcl With %s Error. Error:%v\n", cfgPath, err)
+// 		os.Exit(1)
+// 	}
+// }
+// os.MkdirAll(
+// fmt.Println(os.Getenv("HOME"))
+// xcl.Load()
+// }
